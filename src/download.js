@@ -9,6 +9,7 @@ const Queue = require('./Queue');
 
 module.exports = (torrent, path) => {
   tracker.getPeers(torrent, peers => {
+    console.log(`🔗 Attempting to connect to ${peers.length} peers...`);
     const pieces = new Pieces(torrent);
     const file = fs.openSync(path, 'w');
     peers.forEach(peer => download(peer, torrent, pieces, file));
@@ -17,8 +18,11 @@ module.exports = (torrent, path) => {
 
 function download(peer, torrent, pieces, file) {
   const socket = new net.Socket();
-  socket.on('error', console.log);
+  socket.on('error', (err) => {
+    console.log(`❌ Connection to ${peer.ip}:${peer.port} failed:`, err.message);
+  });
   socket.connect(peer.port, peer.ip, () => {
+    console.log(`✅ Connected to peer: ${peer.ip}:${peer.port}`);
     socket.write(message.buildHandshake(torrent));
   });
   const queue = new Queue(torrent);

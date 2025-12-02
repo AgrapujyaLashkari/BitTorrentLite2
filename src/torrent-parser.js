@@ -3,7 +3,6 @@
 const fs = require('fs');
 const bencode = require('bencode');
 const crypto = require('crypto');
-const bignum = require('bignum');
 
 module.exports.BLOCK_LEN = Math.pow(2, 14);
 
@@ -21,11 +20,15 @@ module.exports.size = torrent => {
     torrent.info.files.map(file => file.length).reduce((a, b) => a + b) :
     torrent.info.length;
 
-  return bignum.toBuffer(size, {size: 8});
+  // Create an 8-byte buffer and write the size as a big-endian 64-bit integer
+  const buffer = Buffer.alloc(8);
+  buffer.writeBigUInt64BE(BigInt(size));
+  return buffer;
 };
 
 module.exports.pieceLen = (torrent, pieceIndex) => {
-  const totalLength = bignum.fromBuffer(this.size(torrent)).toNumber();
+  // Read the 8-byte buffer as a big-endian 64-bit integer
+  const totalLength = Number(this.size(torrent).readBigUInt64BE());
   const pieceLength = torrent.info['piece length'];
 
   const lastPieceLength = totalLength % pieceLength;

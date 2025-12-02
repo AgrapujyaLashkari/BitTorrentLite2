@@ -11,11 +11,14 @@ module.exports.getPeers = (torrent, callback) => {
   const socket = dgram.createSocket('udp4');
   const url = torrent.announce.toString('utf8');
 
+  console.log('📡 Connecting to tracker:', url);
+
   // 1. send connect request
   udpSend(socket, buildConnReq(), url);
 
   socket.on('message', response => {
     if (respType(response) === 'connect') {
+      console.log('✅ Connected to tracker, requesting peers...');
       // 2. receive and parse connect response
       const connResp = parseConnResp(response);
       // 3. send announce request
@@ -24,10 +27,20 @@ module.exports.getPeers = (torrent, callback) => {
     } else if (respType(response) === 'announce') {
       // 4. parse announce response
       const announceResp = parseAnnounceResp(response);
+      console.log(`📋 Found ${announceResp.peers.length} peers (${announceResp.seeders} seeders, ${announceResp.leechers} leechers)`);
       // 5. pass peers to callback
       callback(announceResp.peers);
     }
   });
+
+  socket.on('error', (err) => {
+    console.error('❌ Tracker error:', err.message);
+  });
+
+  // Timeout if no response
+  setTimeout(() => {
+    console.log('⏱️  No response from tracker after 10 seconds');
+  }, 10000);
 };
 
 function udpSend(socket, message, rawUrl, callback=()=>{}) {
@@ -85,7 +98,7 @@ function buildAnnounceReq(connId, torrent, port=6881) {
   // event
   buf.writeUInt32BE(0, 80);
   // ip address
-  buf.writeUInt32BE(0, 80);
+  buf.writeUInt32BE(0, 84);
   // key
   crypto.randomBytes(4).copy(buf, 88);
   // num want
