@@ -7,19 +7,79 @@ const message = require('./message');
 const Pieces = require('./Pieces');
 const Queue = require('./Queue');
 
+const DEFAULT_INTERVAL_SECONDS = 1800; // 30 minutes default if tracker doesn't specify
+const MIN_INTERVAL_SECONDS = 60; // Minimum 1 minute to avoid excessive requests
+
 module.exports = (torrent, path) => {
-  tracker.getPeers(torrent, peers => {
-    console.log(`🔗 Attempting to connect to ${peers.length} peers...`);
-    const pieces = new Pieces(torrent);
-    const file = fs.openSync(path, 'w');
-    peers.forEach(peer => download(peer, torrent, pieces, file));
+  const pieces = new Pieces(torrent);
+  const file = fs.openSync(path, 'w');
+  const connectedPeers = new Set();
+  let peerDiscoveryInterval = null;
+
+  function connectToPeers(peers, interval) {
+    // Stop peer discovery if download is complete
+    if (pieces.isDone()) {
+      if (peerDiscoveryInterval) {
+        clearInterval(peerDiscoveryInterval);
+        peerDiscoveryInterval = null;
+        console.log('✅ Download complete, stopping peer discovery');
+      }
+      return;
+    }
+
+    const newPeers = peers.filter(peer => {
+      const peerKey = `${peer.ip}:${peer.port}`;
+      return !connectedPeers.has(peerKey);
+    });
+
+    if (newPeers.length > 0) {
+      console.log(`🔗 Attempting to connect to ${newPeers.length} new peers...`);
+      newPeers.forEach(peer => {
+        const peerKey = `${peer.ip}:${peer.port}`;
+        connectedPeers.add(peerKey);
+        download(peer, torrent, pieces, file, () => {
+          connectedPeers.delete(peerKey);
+        });
+      });
+    } else {
+      console.log('ℹ️  No new peers to connect to');
+    }
+
+    // Set up periodic peer discovery if interval is provided
+    if (interval && !peerDiscoveryInterval) {
+      const intervalMs = Math.max(interval * 1000, MIN_INTERVAL_SECONDS * 1000);
+      console.log(`⏰ Setting up periodic peer discovery every ${interval / 60} minutes`);
+      
+      peerDiscoveryInterval = setInterval(() => {
+        // Check if download is complete before discovering more peers
+        if (pieces.isDone()) {
+          clearInterval(peerDiscoveryInterval);
+          peerDiscoveryInterval = null;
+          console.log('✅ Download complete, stopping peer discovery');
+          return;
+        }
+        console.log('🔄 Discovering more peers...');
+        tracker.getPeers(torrent, (newPeers, newInterval) => {
+          connectToPeers(newPeers, newInterval || interval);
+        });
+      }, intervalMs);
+    }
+  }
+
+  // Initial peer discovery
+  tracker.getPeers(torrent, (peers, interval) => {
+    connectToPeers(peers, interval || DEFAULT_INTERVAL_SECONDS);
   });
 };
 
-function download(peer, torrent, pieces, file) {
+function download(peer, torrent, pieces, file, onDisconnect) {
   const socket = new net.Socket();
   socket.on('error', (err) => {
     console.log(`❌ Connection to ${peer.ip}:${peer.port} failed:`, err.message);
+    if (onDisconnect) onDisconnect();
+  });
+  socket.on('close', () => {
+    if (onDisconnect) onDisconnect();
   });
   socket.connect(peer.port, peer.ip, () => {
     console.log(`✅ Connected to peer: ${peer.ip}:${peer.port}`);
