@@ -46,6 +46,10 @@ module.exports = class {
     return `${hours}h ${minutes}m`;
   }
   startProgressDisplay() {
+    // Don't start if already running
+    if (this.updateInterval) {
+      return;
+    }
     this.updateInterval = setInterval(() => {
       this.updateDisplay();
     }, UPDATE_INTERVAL_MS);
@@ -128,6 +132,11 @@ module.exports = class {
     }
     const blockIndex = pieceBlock.begin / tp.BLOCK_LEN;
     return !this._requested[pieceBlock.index][blockIndex];
+  }
+  resetRequestedState() {
+    // Reset requested state to match received state
+    // This allows pieces that were requested but not received to be requested again
+    this._requested = this._received.map((blocks) => blocks.slice());
   }
   isDone() {
     return this._received.every((blocks) => blocks.every((i) => i));
