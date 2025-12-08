@@ -7,20 +7,114 @@ const Pieces = require("./Pieces");
 const Queue = require("./Queue");
 const DEFAULT_INTERVAL_SECONDS = 1800;
 const MIN_INTERVAL_SECONDS = 60;
+const NO_PEER_TIMEOUT_MS = 120000; // 2 minutes timeout if no peers/data
+const WARNING_INTERVALS_MS = [90000, 60000, 30000, 15000, 10000, 5000]; // Warning times before timeout
 module.exports = (torrent, path) => {
   const pieces = new Pieces(torrent);
   const file = fs.openSync(path, "w");
   const connectedPeers = new Set();
+  const activeDataTransferPeers = new Set(); // Peers that are actually transferring data
   let peerDiscoveryInterval = null;
+  let noPeerTimeout = null;
+  let warningIntervals = [];
+  let lastDataTransferTime = Date.now();
+  let hasReceivedData = false;
+  function cleanupAndExit(exitCode = 0, message = "") {
+    // Clear all intervals and timeouts
+    if (peerDiscoveryInterval) {
+      clearInterval(peerDiscoveryInterval);
+      peerDiscoveryInterval = null;
+    }
+    if (noPeerTimeout) {
+      clearTimeout(noPeerTimeout);
+      noPeerTimeout = null;
+    }
+    warningIntervals.forEach((interval) => clearTimeout(interval));
+    warningIntervals = [];
+    pieces.stopProgressDisplay();
+    try {
+      fs.closeSync(file);
+    } catch (e) {}
+    if (message) {
+      process.stderr.write(message + "\n");
+    }
+    process.exit(exitCode);
+  }
+  function resetNoPeerTimeout() {
+    // Clear existing timeout and warnings
+    if (noPeerTimeout) {
+      clearTimeout(noPeerTimeout);
+      noPeerTimeout = null;
+    }
+    warningIntervals.forEach((interval) => clearTimeout(interval));
+    warningIntervals = [];
+    // Set up new timeout
+    noPeerTimeout = setTimeout(() => {
+      if (!hasReceivedData || activeDataTransferPeers.size === 0) {
+        pieces.stopProgressDisplay();
+        process.stderr.write(
+          "\n:warning: No active peer connections or data transfer detected.\n"
+        );
+        if (!hasReceivedData) {
+          process.stderr.write(
+            ":x: No data received. Exiting due to timeout...\n"
+          );
+        } else {
+          process.stderr.write(
+            ":x: All peer connections lost. Exiting due to timeout...\n"
+          );
+        }
+        cleanupAndExit(1);
+      }
+    }, NO_PEER_TIMEOUT_MS);
+    // Set up warning intervals
+    WARNING_INTERVALS_MS.forEach((warningTime) => {
+      const warningTimeout = setTimeout(() => {
+        const remainingSeconds = Math.ceil(warningTime / 1000);
+        if (!hasReceivedData || activeDataTransferPeers.size === 0) {
+          if (!hasReceivedData) {
+            process.stderr.write(
+              `:hourglass_flowing_sand: Warning: No data transfer detected. Will exit in ${remainingSeconds}s if no progress...\n`
+            );
+          } else {
+            process.stderr.write(
+              `:hourglass_flowing_sand: Warning: No active peer connections. Will exit in ${remainingSeconds}s if no reconnection...\n`
+            );
+          }
+        }
+      }, NO_PEER_TIMEOUT_MS - warningTime);
+      warningIntervals.push(warningTimeout);
+    });
+  }
+  // Create download module interface
+  const downloadModule = {
+    markDataTransfer: (peerKey) => {
+      hasReceivedData = true;
+      lastDataTransferTime = Date.now();
+      activeDataTransferPeers.add(peerKey);
+      // Reset timeout when we have active data transfer
+      if (activeDataTransferPeers.size > 0) {
+        resetNoPeerTimeout();
+      }
+    },
+    markPeerDisconnected: (peerKey) => {
+      activeDataTransferPeers.delete(peerKey);
+      // If no active peers and no recent data, start timeout countdown
+      if (activeDataTransferPeers.size === 0) {
+        const timeSinceLastData = Date.now() - lastDataTransferTime;
+        if (timeSinceLastData > 30000) {
+          // 30 seconds since last data
+          resetNoPeerTimeout();
+        }
+      }
+    },
+    onDownloadComplete: () => {
+      cleanupAndExit(0, ":white_check_mark: Download complete!");
+    },
+  };
   function connectToPeers(peers, interval) {
     if (pieces.isDone()) {
-      if (peerDiscoveryInterval) {
-        clearInterval(peerDiscoveryInterval);
-        peerDiscoveryInterval = null;
-        process.stderr.write(
-          ":white_check_mark: Download complete, stopping peer discovery\n"
-        );
-      }
+      cleanupAndExit(0, ":white_check_mark: Download complete!");
       return;
     }
     const newPeers = peers.filter((peer) => {
@@ -34,9 +128,16 @@ module.exports = (torrent, path) => {
       newPeers.forEach((peer) => {
         const peerKey = `${peer.ip}:${peer.port}`;
         connectedPeers.add(peerKey);
-        download(peer, torrent, pieces, file, () => {
-          connectedPeers.delete(peerKey);
-        });
+        download(
+          peer,
+          torrent,
+          pieces,
+          file,
+          () => {
+            connectedPeers.delete(peerKey);
+          },
+          downloadModule
+        );
       });
     } else {
       process.stderr.write(
@@ -70,20 +171,38 @@ module.exports = (torrent, path) => {
       }, intervalMs);
     }
   }
+  // Start the no-peer timeout mechanism
+  resetNoPeerTimeout();
   // Initial peer discovery
   tracker.getPeers(torrent, (peers, interval) => {
+    if (peers.length === 0) {
+      process.stderr.write(
+        ":warning: No peers found from tracker. Will retry...\n"
+      );
+    }
     connectToPeers(peers, interval || DEFAULT_INTERVAL_SECONDS);
   });
+  // Return cleanup function for external use
+  return {
+    cleanup: () => cleanupAndExit(0),
+  };
 };
-function download(peer, torrent, pieces, file, onDisconnect) {
+function download(peer, torrent, pieces, file, onDisconnect, downloadModule) {
   const socket = new net.Socket();
+  const peerKey = `${peer.ip}:${peer.port}`;
   socket.on("error", (err) => {
     process.stderr.write(
       `:x: Connection to ${peer.ip}:${peer.port} failed: ${err.message}\n`
     );
+    if (downloadModule) {
+      downloadModule.markPeerDisconnected(peerKey);
+    }
     if (onDisconnect) onDisconnect();
   });
   socket.on("close", () => {
+    if (downloadModule) {
+      downloadModule.markPeerDisconnected(peerKey);
+    }
     if (onDisconnect) onDisconnect();
   });
   socket.connect(peer.port, peer.ip, () => {
@@ -94,7 +213,16 @@ function download(peer, torrent, pieces, file, onDisconnect) {
   });
   const queue = new Queue(torrent);
   onWholeMsg(socket, (msg) =>
-    msgHandler(msg, socket, pieces, queue, torrent, file)
+    msgHandler(
+      msg,
+      socket,
+      pieces,
+      queue,
+      torrent,
+      file,
+      downloadModule,
+      peerKey
+    )
   );
 }
 function onWholeMsg(socket, callback) {
@@ -112,7 +240,16 @@ function onWholeMsg(socket, callback) {
     }
   });
 }
-function msgHandler(msg, socket, pieces, queue, torrent, file) {
+function msgHandler(
+  msg,
+  socket,
+  pieces,
+  queue,
+  torrent,
+  file,
+  downloadModule,
+  peerKey
+) {
   if (isHandshake(msg)) {
     socket.write(message.buildInterested());
   } else {
@@ -122,7 +259,16 @@ function msgHandler(msg, socket, pieces, queue, torrent, file) {
     if (m.id === 4) haveHandler(socket, pieces, queue, m.payload);
     if (m.id === 5) bitfieldHandler(socket, pieces, queue, m.payload);
     if (m.id === 7)
-      pieceHandler(socket, pieces, queue, torrent, file, m.payload);
+      pieceHandler(
+        socket,
+        pieces,
+        queue,
+        torrent,
+        file,
+        m.payload,
+        downloadModule,
+        peerKey
+      );
   }
 }
 function isHandshake(msg) {
@@ -154,7 +300,20 @@ function bitfieldHandler(socket, pieces, queue, payload) {
   });
   if (queueEmpty) requestPiece(socket, pieces, queue);
 }
-function pieceHandler(socket, pieces, queue, torrent, file, pieceResp) {
+function pieceHandler(
+  socket,
+  pieces,
+  queue,
+  torrent,
+  file,
+  pieceResp,
+  downloadModule,
+  peerKey
+) {
+  // Mark that we're receiving data from this peer
+  if (downloadModule && peerKey) {
+    downloadModule.markDataTransfer(peerKey);
+  }
   pieces.addReceived(pieceResp);
   const offset =
     pieceResp.index * torrent.info["piece length"] + pieceResp.begin;
@@ -166,6 +325,12 @@ function pieceHandler(socket, pieces, queue, torrent, file, pieceResp) {
     try {
       fs.closeSync(file);
     } catch (e) {}
+    // Use the download module's completion handler
+    if (downloadModule && downloadModule.onDownloadComplete) {
+      downloadModule.onDownloadComplete();
+    } else {
+      process.exit(0);
+    }
   } else {
     requestPiece(socket, pieces, queue);
   }
