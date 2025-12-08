@@ -28,8 +28,8 @@ module.exports.getPeers = (torrent, callback) => {
       // 4. parse announce response
       const announceResp = parseAnnounceResp(response);
       console.log(`📋 Found ${announceResp.peers.length} peers (${announceResp.seeders} seeders, ${announceResp.leechers} leechers)`);
-      // 5. pass peers to callback
-      callback(announceResp.peers);
+      // 5. pass peers and interval to callback
+      callback(announceResp.peers, announceResp.interval);
     }
   });
 
@@ -121,8 +121,9 @@ function parseAnnounceResp(resp) {
   return {
     action: resp.readUInt32BE(0),
     transactionId: resp.readUInt32BE(4),
-    leechers: resp.readUInt32BE(8),
-    seeders: resp.readUInt32BE(12),
+    interval: resp.readUInt32BE(8),
+    leechers: resp.readUInt32BE(12),
+    seeders: resp.readUInt32BE(16),
     peers: group(resp.slice(20), 6).map(address => {
       return {
         ip: address.slice(0, 4).join('.'),
